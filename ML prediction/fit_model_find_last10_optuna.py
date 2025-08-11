@@ -554,9 +554,9 @@ else:
         study = optuna.create_study(
             direction="maximize",
             study_name="joker_optuna",
-            storage=storage_url,           # <- use DB if set
-            load_if_exists=True,           # <- continue if DB already exists
             pruner=optuna.pruners.MedianPruner(n_warmup_steps=2),
+            load_if_exists=True,                 # <-- allow multiple workers to attach
+            storage=os.environ.get("OPTUNA_STORAGE")  # <-- use the DB you exported
         )
         study.optimize(objective, n_trials=args.max_trials, timeout=args.timeout or None, show_progress_bar=args.verbose)
 
