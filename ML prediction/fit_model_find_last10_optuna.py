@@ -21,7 +21,7 @@ import time
 from itertools import combinations
 from dataclasses import dataclass, asdict
 from pathlib import Path
-
+import os
 import numpy as np
 import xgboost as xgb
 
@@ -547,10 +547,16 @@ else:
             return steps_ok * STEPS_WEIGHT - (cfg.seeds * cfg.candidates)
 
 
+        storage_url = os.environ.get("OPTUNA_STORAGE")
+        if args.verbose:
+            print(f"[OPTUNA] storage={storage_url or 'in-memory'}")
+
         study = optuna.create_study(
             direction="maximize",
             study_name="joker_optuna",
-            pruner=optuna.pruners.MedianPruner(n_warmup_steps=2)
+            storage=storage_url,           # <- use DB if set
+            load_if_exists=True,           # <- continue if DB already exists
+            pruner=optuna.pruners.MedianPruner(n_warmup_steps=2),
         )
         study.optimize(objective, n_trials=args.max_trials, timeout=args.timeout or None, show_progress_bar=args.verbose)
 
