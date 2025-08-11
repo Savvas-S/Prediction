@@ -1,0 +1,11 @@
+{
+  "decay_half": 163.5763022717434,
+  "cooldown": 5,
+  "xgb_main_estimators": 668,
+  "xgb_jok_estimators": 615,
+  "xgb_main_depth": 6,
+  "xgb_jok_depth": 5,
+  "xgb_main_min_child_weight": 2.0,
+  "xgb_jok_min_child_weight": 2.0,
+  "temp_main": 1.4923727605937445
+}

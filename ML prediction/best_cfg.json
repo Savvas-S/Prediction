@@ -1,0 +1,18 @@
+{
+  "decay_half": 117.96829493642885,
+  "cooldown": 7,
+  "xgb_main_estimators": 862,
+  "xgb_jok_estimators": 715,
+  "xgb_main_depth": 5,
+  "xgb_jok_depth": 7,
+  "xgb_main_min_child_weight": 1.0,
+  "xgb_jok_min_child_weight": 1.0,
+  "temp_main": 1.4919314947672415,
+  "temp_joker": 1.355867578107125,
+  "topk_combo": 21,
+  "seeds": 131,
+  "candidates": 11978,
+  "pair_window": 346,
+  "pair_weight": 0.571420721888425,
+  "spread_weight": 0.13374730841265736
+}

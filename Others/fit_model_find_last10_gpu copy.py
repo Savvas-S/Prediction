@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-fit_model_find_last10.py (FAST, GPU train + cached features)
+fit_model_find_last10.py (FAST, GPU train + cached features; robust to messy CSV)
 
 - Random-search hyperparams until one sequentially "finds" the last 10 draws
   (10th -> 1st), adding each found draw back to training before the next step.
@@ -26,7 +26,7 @@ import xgboost as xgb
 
 # ---------------- CLI ----------------
 p = argparse.ArgumentParser(description="FAST GPU model search for last-10; optional predict-next.")
-p.add_argument("--csv", default="joker_results.csv", help="CSV with header + 6 cols (5 mains + joker).")
+p.add_argument("--csv", default="joker_results2_reversed.csv", help="CSV with header + 6 cols (5 mains + joker).")
 p.add_argument("--seed", type=int, default=123, help="Base RNG seed.")
 p.add_argument("--max-trials", type=int, default=500, help="Max random configs to try.")
 p.add_argument("--verbose", action="store_true", help="Verbose progress.")
@@ -53,20 +53,37 @@ JOKER_MIN, JOKER_MAX = 1, 20
 ALL_MAIN = np.arange(MAIN_MIN, MAIN_MAX + 1, dtype=np.int16)
 ALL_JOKER = np.arange(JOKER_MIN, JOKER_MAX + 1, dtype=np.int16)
 
-# ---------------- Data ----------------
-rows = []
-with open(args.csv, "r", encoding="utf-8") as f:
-    r = csv.reader(f)
-    _ = next(r, None)  # header
-    for row in r:
-        if len(row) >= 6:
-            try:
-                rows.append(list(map(int, row[:6])))
-            except ValueError:
-                pass
+# ---------------- Robust CSV loader ----------------
+def load_clean_rows(csv_path):
+    raw = []
+    with open(csv_path, "r", encoding="utf-8") as f:
+        r = csv.reader(f)
+        _ = next(r, None)  # header
+        for row in r:
+            if not row:
+                continue
+            vals = []
+            for x in row[:6]:
+                try:
+                    vals.append(int(x))
+                except Exception:
+                    vals.append(None)
+            # must have at least 6 ints
+            if len(vals) < 6 or any(v is None for v in vals[:6]):
+                continue
+            mains, jk = vals[:5], vals[5]
+            # enforce valid ranges
+            if not all(MAIN_MIN <= n <= MAIN_MAX for n in mains):
+                continue
+            if not (JOKER_MIN <= jk <= JOKER_MAX):
+                continue
+            raw.append([*mains, jk])
+    return raw
+
+rows = load_clean_rows(args.csv)
 
 if len(rows) < 200:
-    raise SystemExit("Not enough rows. Need a few hundred at least.")
+    raise SystemExit(f"Not enough usable rows in {args.csv}. Got {len(rows)}, need >= 200.")
 
 # Latest-first -> chronological
 chron = list(reversed(rows))
@@ -77,6 +94,9 @@ if N < args.min_history + 10:
 # last 10 (chronological inside those)
 held10 = chron[-10:]        # 10th, 9th, ..., 1st among the last 10
 train_prefix = chron[:-10]  # base history
+
+if args.verbose:
+    print(f"[DATA] Total OK rows: {N} | Train prefix: {len(train_prefix)} | Held-out last10: {len(held10)}")
 
 # ---------------- Model Config ----------------
 @dataclass
@@ -128,9 +148,13 @@ def build_indicators(train_rows):
     main_ind = np.zeros((MAIN_MAX, N), dtype=np.int8)   # 45 x N
     joker_ind = np.zeros((JOKER_MAX, N), dtype=np.int8) # 20 x N
     for t, draw in enumerate(train_rows):
-        for n in draw[:5]:
-            main_ind[n-1, t] = 1
-        joker_ind[draw[5]-1, t] = 1
+        mains = draw[:5]
+        jk = draw[5]
+        for n in mains:
+            if MAIN_MIN <= n <= MAIN_MAX:
+                main_ind[n-1, t] = 1
+        if JOKER_MIN <= jk <= JOKER_MAX:
+            joker_ind[jk-1, t] = 1
     return main_ind, joker_ind
 
 # ---------------- Feature cache (per-trial) ----------------
@@ -160,11 +184,14 @@ class FeatureCache:
             self.rec_main[:, t] = np.sqrt(gaps_m) / norm
             self.rec_jok[:,  t] = np.sqrt(gaps_j) / norm
 
-            # update last_seen with draw t-1
+            # update last_seen with draw t-1 (guard ranges)
             d = train_rows[t-1]
             for n in d[:5]:
-                last_seen_main[n-1] = t-1
-            last_seen_jok[d[5]-1] = t-1
+                if MAIN_MIN <= n <= MAIN_MAX:
+                    last_seen_main[n-1] = t-1
+            j = d[5]
+            if JOKER_MIN <= j <= JOKER_MAX:
+                last_seen_jok[j-1] = t-1
 
         # Decay (EWMA) for mains/jokers for this trial’s half-life
         alpha = 0.5 ** (1.0 / max(1e-9, float(decay_half)))
@@ -217,8 +244,13 @@ class FeatureCache:
             stk  = self._win_sum(self.cs_main, t, 12) / max(1, 5 * draws_12)
 
             Xm = np.column_stack([f50, f200, f800, fexp, rec, stk]).astype(np.float32)
+
             present = np.zeros(MAIN_MAX, dtype=np.int8)
-            present[np.array(self.train_rows[t][:5]) - 1] = 1
+            row = self.train_rows[t] if t < len(self.train_rows) else None
+            if row and len(row) >= 5:
+                for n in row[:5]:
+                    if MAIN_MIN <= n <= MAIN_MAX:
+                        present[n-1] = 1
 
             Xm_list.append(Xm)
             ym_list.append(present)
@@ -231,8 +263,12 @@ class FeatureCache:
             stkj  = self._win_sum(self.cs_jok, t, 12) / max(1, 1 * draws_12)
 
             Xj = np.column_stack([f50j, f200j, f800j, fexpj, recj, stkj]).astype(np.float32)
+
             yj = np.zeros(JOKER_MAX, dtype=np.int8)
-            yj[self.train_rows[t][5] - 1] = 1
+            if row and len(row) >= 6:
+                jk = row[5]
+                if JOKER_MIN <= jk <= JOKER_MAX:
+                    yj[jk-1] = 1
 
             Xj_list.append(Xj)
             yj_list.append(yj)
@@ -274,7 +310,7 @@ def train_models_gpu_xgb(Xmf, y_main, Xjf, y_jok, cfg, seed):
     common = dict(
         tree_method="hist",
         device="cuda",
-        predictor="gpu_predictor",   # <- keep prediction on GPU, no DMatrix fallback
+        predictor="gpu_predictor",   # keep prediction on GPU
         max_bin=256,
         subsample=0.92,
         colsample_bytree=0.88,
@@ -306,7 +342,6 @@ def train_models_gpu_xgb(Xmf, y_main, Xjf, y_jok, cfg, seed):
 def apply_cooldown_probs(prob_vec, ind_mat, k_recent):
     if k_recent <= 0: return prob_vec
     t_end = ind_mat.shape[1]
-    cool = np.ones_like(prob_vec, dtype=np.float32)
     tail = ind_mat[:, max(0, t_end-k_recent):t_end].sum(axis=1).astype(np.float32)  # (45,) or (20,)
     cool = 1.0 / (1.0 + tail)
     out = prob_vec * cool
@@ -341,7 +376,6 @@ def ticket_score(mains, p_main, pair_score, pair_weight, spread_weight):
     spread = (ms[-1] - ms[0]) / 44.0
     return base + ps + spread_weight * spread
 
-# vectorized candidate generator (NumPy)
 def _gumbel_keys(logp, n, rng):
     g = rng.gumbel(size=(n, logp.shape[0])).astype(np.float32)
     return logp[None, :] + g
@@ -401,7 +435,7 @@ def rank_and_pick(found_sets, p_main, p_jok, pair_score, cfg, sets_count, divers
     return out
 
 # ---------------- One prediction cycle ----------------
-def predict_sets_once(cache: FeatureCache, cfg: ModelConfig, t_end: int, seed_base: int):
+def predict_sets_once(cache, cfg: ModelConfig, t_end: int, seed_base: int):
     # Training data = history up to t_end (exclusive)
     Xmf, y_main, Xjf, y_jok = cache.build_Xy_up_to(t_end)
 
@@ -461,22 +495,24 @@ for trial in range(1, args.max_trials + 1):
         print(f"\n[Trial {trial}] config={asdict(cfg)}")
 
     # Build per-trial cache ONCE (decay_half-specific)
-    cache = FeatureCache(train_prefix, decay_half=cfg.decay_half, min_history=args.min_history)
-
+    # cache = FeatureCache(train_prefix, decay_half=cfg.decay_half, min_history=args.min_history)
+    cache_rows = train_prefix + held10      # <-- include the 10 held draws so t_end can advance safely
+    cache = FeatureCache(cache_rows, decay_half=cfg.decay_half, min_history=args.min_history)
     ok = True
     # Steps: find held10[0] at t_end=len(train_prefix), add; then held10[1], ...
     t_end = len(train_prefix)
     for idx, target in enumerate(held10, start=1):
+        if args.verbose:
+            print(f"  -> Step {idx}/10: training with {t_end} draws ...", flush=True)
         found_sets, _, _, _ = predict_sets_once(cache, cfg, t_end, seed_base=args.seed + trial*1000 + idx)
         if exact_match_in(found_sets, target):
-            # "Add" the draw by bumping t_end; cached features already cover the whole prefix+held10
-            t_end += 1
+            t_end += 1  # add the draw
             if args.verbose:
-                print(f"  Step {idx}/10: FOUND {target}")
+                print(f"     FOUND {target}")
         else:
             ok = False
             if args.verbose:
-                print(f"  Step {idx}/10: NOT FOUND {target} -> restart")
+                print(f"     NOT FOUND {target} -> restart")
             break
 
     if ok:
@@ -498,7 +534,8 @@ if winning_cfg is None:
 
 # ---------------- Predict-next (optional) ----------------
 if args.predict_next:
-    # Rebuild cache on FULL history with the same decay_half
+    if args.verbose:
+        print("\n[Predict-next] Rebuilding features on FULL history ...", flush=True)
     cache_full = FeatureCache(chron, decay_half=winning_cfg.decay_half, min_history=args.min_history)
     t_end_full = len(chron)
 
